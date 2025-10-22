@@ -56,8 +56,6 @@ def main():
         request = get_request(s3, "usu-cs5270-scuba-requests")
         if request:
             process_request(request, args.storage, s3, dynamo, "usu-cs5270-scuba-web")
-        else:
-            #print("No requests found, sleeping...")
         time.sleep(args.interval)
 
 if __name__ == "__main__":

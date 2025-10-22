@@ -8,6 +8,8 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.12"
 boto3 = "^1.40.56"
+pytest = "^8.4.2"
+moto = {extras = ["boto3"], version = "^5.1.15"}
 
 
 [build-system]
