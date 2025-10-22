@@ -2,6 +2,7 @@ import argparse
 import boto3
 import json
 import time
+import logging
 
 def get_request(s3, bucket_name):
     response = s3.list_objects_v2(Bucket=bucket_name)
@@ -17,33 +18,47 @@ def get_request(s3, bucket_name):
     return data
 
 def store_in_s3(s3, bucket_name, widget):
-    key = f"{widget}.json"
+    processed_owner = widget['owner'].replace(' ', '-').lower()
+
+    widget_id = widget['widgetId']
+
+    key = f"widgets/{processed_owner}/{widget_id}"
+    print(key)
     s3.put_object(Bucket=bucket_name, Key=key, Body=json.dumps(widget))
 
 def dynamo(dynamo, widget):
-    dynamo.put_item(Item=widget)
+    dynamo_item = widget.copy()
 
+    other_attributes_list = dynamo_item.pop('otherAttributes', [])
+
+    for attr in other_attributes_list:
+        if 'name' in attr and 'value' in attr:
+            dynamo_item[attr['name']] = attr['value']
+
+    dynamo.put_item(Item=dynamo_item)
+    
 def process_request(request, storage, s3, dyanmo, target):
 
-    print(f"Processing request: {request}")
+    #print(f"Processing request: {request}")
     action = request.get("type")
-    widget = request.get("widgetId")
+    widget = request.get("widget")
 
     if action == "create" or action == "update":
         if storage == "s3":
-            store_in_s3(s3, target, widget)
+            print(action)
+            store_in_s3(s3, target, request)
         else:
-            store_widget_dynamo(dynamo, widget)
+            dynamo(dynamo, widget)
     elif action == "delete":
-        print("Delet not implemented yet")
+        logging.info("Delet not implemented yet")
     else:
-        print(f"Unknown action: {action}")
+        logging.info(f"Unknown action: {action}")
 
 def main():
     parser = argparse.ArgumentParser(description="Widget Consumer")
     parser.add_argument("--storage", choices=["s3", "dynamo"], required=True,
                         help="Storage backend for widgets")
-    parser.add_argument("--interval", type=int, default=.001, help="Polling interval in seconds")
+    parser.add_argument("--interval", type=int, default=.1, help="Polling interval in seconds")
     parser.add_argument("--table", help="DynamoDB table name (if using DynamoDB storage)")
     parser.add_argument("--bucket", help="Bucket table name (if using S3 storage)")
     args = parser.parse_args()
@@ -56,7 +71,8 @@ def main():
         request = get_request(s3, "usu-cs5270-scuba-requests")
         if request:
             process_request(request, args.storage, s3, dynamo, "usu-cs5270-scuba-web")
-        time.sleep(args.interval)
+        else:
+            time.sleep(args.interval)
 
 if __name__ == "__main__":
     main()
