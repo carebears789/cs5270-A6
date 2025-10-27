@@ -26,7 +26,7 @@ def store_in_s3(s3, bucket_name, widget):
     print(key)
     s3.put_object(Bucket=bucket_name, Key=key, Body=json.dumps(widget))
 
-def dynamo(dynamo, widget):
+def dynamo_store(dynamo, widget):
     dynamo_item = widget.copy()
 
     other_attributes_list = dynamo_item.pop('otherAttributes', [])
@@ -48,7 +48,7 @@ def process_request(request, storage, s3, dyanmo, target):
             print(action)
             store_in_s3(s3, target, request)
         else:
-            dynamo(dynamo, widget)
+            dynamo_store(dyanmo, widget)
     elif action == "delete":
         logging.info("Delet not implemented yet")
     else:
@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--interval", type=int, default=.1, help="Polling interval in seconds")
     parser.add_argument("--table", help="DynamoDB table name (if using DynamoDB storage)")
     parser.add_argument("--bucket", help="Bucket table name (if using S3 storage)")
+    parser.add_argument("--destination", help="Bucket Destination table name (if using S3 storage)")
     args = parser.parse_args()
     
 
@@ -68,9 +69,9 @@ def main():
     s3 = boto3.client("s3")
     dynamo = boto3.resource("dynamodb").Table(args.table) if args.table else None
     while True:
-        request = get_request(s3, "usu-cs5270-scuba-requests")
+        request = get_request(s3, args.bucket)
         if request:
-            process_request(request, args.storage, s3, dynamo, "usu-cs5270-scuba-web")
+            process_request(request, args.storage, s3, dynamo, args.destination)
         else:
             time.sleep(args.interval)
 
