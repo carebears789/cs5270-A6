@@ -7,37 +7,25 @@ from botocore.exceptions import ClientError
 import sys
 
 # ------------------------------------------------------
-# SETUP LOGGING (FILE ONLY, CLEAN)
+# SETUP LOGGING
 # ------------------------------------------------------
-
 LOG_FILE = "widget_app.log"
-
-# Remove existing handlers so nothing logs to terminal
-for handler in logging.root.handlers[:]:
-    logging.root.removeHandler(handler)
-
 logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,                   # <--- CLEAN INFO LOGGING
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout) # Log to console
+    ]
 )
-
 logger = logging.getLogger("WidgetApp")
-
-
-# Add a StreamHandler to also print to terminal
-stream_handler = logging.StreamHandler(sys.stdout)
-stream_handler.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-stream_handler.setFormatter(formatter)
-logger.addHandler(stream_handler)
 
 # ------------------------------------------------------
 # AWS CLIENT FACTORY
 # ------------------------------------------------------
-
 class AWSClientFactory:
+    """Creates AWS clients from a single session."""
     def __init__(self, profile: str, region: str):
         logger.info(f"Initializing AWS session (profile={profile}, region={region})")
         self.session = boto3.Session(profile_name=profile, region_name=region)
@@ -51,217 +39,219 @@ class AWSClientFactory:
     def dynamodb(self):
         return self.session.resource("dynamodb")
 
-
 # ------------------------------------------------------
-# S3 MANAGER
+# WIDGET STORAGE (SIMPLIFIED)
 # ------------------------------------------------------
-
-class S3Manager:
-    def __init__(self, client, bucket: str, use_owner_prefix: bool):
-        self.client = client
-        self.bucket = bucket
-        self.use_owner_prefix = use_owner_prefix
-
-        if bucket:
-            logger.info(f"S3 enabled → bucket={bucket}, prefix_by_owner={use_owner_prefix}")
+class WidgetStorage:
+    """Handles simple storage to S3 and DynamoDB."""
+    def __init__(self, s3_client, db_resource, db_table_name, s3_bucket_name, s3_key_prefix):
+        self.s3 = s3_client
+        self.db = db_resource
+        self.s3_bucket = s3_bucket_name
+        self.s3_prefix = s3_key_prefix
+        
+        if db_table_name:
+            self.db_table = db_resource.Table(db_table_name)
+            logger.info(f"DynamoDB storage enabled → {db_table_name}")
         else:
-            logger.info("S3 disabled (no bucket provided)")
+            self.db_table = None
+            logger.info("DynamoDB storage disabled.")
 
-    def store_widget(self, widget: dict):
-        if not self.bucket:
-            return
+        if s3_bucket_name:
+            logger.info(f"S3 storage enabled → s3://{s3_bucket_name}/{s3_key_prefix}")
+        else:
+            logger.info("S3 storage disabled.")
 
-        owner = widget.get("owner", "unknown").replace(" ", "_")
+    def _get_s3_key(self, widget: dict) -> str:
+        """
+        [cite_start]Generates the S3 key based on HW6 rules [cite: 463-466].
+        Format: widgets/{owner-with-dashes}/{widget-id}.json
+        """
+        widget_id = widget.get("widgetId", "unknown-id")
+        owner = widget.get("owner", "unknown-owner")
+        
+        # HW6 format: replace spaces with dashes, lowercase
+        formatted_owner = owner.replace(" ", "-").lower()
+        
+        # HW6 format: widgets/{owner}/{widget id}
+        return f"{self.s3_prefix}{formatted_owner}/{widget_id}.json"
+
+    def create_or_update(self, widget: dict):
+        """Simple 'upsert' for both create and update."""
         widget_id = widget["widgetId"]
-        key = f"{owner}/{widget_id}.json" if self.use_owner_prefix else f"{widget_id}.json"
+        
+        # Store in DynamoDB
+        if self.db_table:
+            logger.info(f"DynamoDB UPSERT → {self.db_table.name}:{widget_id}")
+            # Simple put_item, no partial update or flattening
+            self.db_table.put_item(Item=widget)
 
-        logger.info(f"S3 WRITE → s3://{self.bucket}/{key}")
-
-        try:
-            self.client.put_object(
-                Bucket=self.bucket,
+        # Store in S3
+        if self.s3_bucket:
+            key = self._get_s3_key(widget)
+            logger.info(f"S3 WRITE → s3://{self.s3_bucket}/{key}")
+            self.s3.put_object(
+                Bucket=self.s3_bucket,
                 Key=key,
                 Body=json.dumps(widget).encode("utf-8")
             )
-        except Exception as e:
-            logger.error(f"S3 write failed for {key}: {e}")
-            raise
 
-
-# ------------------------------------------------------
-# DYNAMODB MANAGER
-# ------------------------------------------------------
-
-class DynamoDBManager:
-    def __init__(self, dynamodb_resource, table_name="Widgets", key_name="id"):
-        self.table = dynamodb_resource.Table(table_name)
-        self.key_name = key_name
-        logger.info(f"DynamoDB connected → table={table_name}, key={key_name}")
-
-    def _map_widget_to_item(self, widget: dict):
-        item = widget.copy()
-        item[self.key_name] = widget["widgetId"]
-        return item
-
-    def create_or_update_widget(self, widget: dict):
-        item = self._map_widget_to_item(widget)
-        logger.info(f"DynamoDB UPSERT → {self.table.name}:{item[self.key_name]}")
-
-        try:
-            self.table.put_item(Item=item)
-        except Exception as e:
-            logger.error(f"DynamoDB upsert failed ({item[self.key_name]}): {e}")
-            raise
-
-    def delete_widget(self, widget_id: str):
-        logger.info(f"DynamoDB DELETE → {self.table.name}:{widget_id}")
-
-        try:
-            self.table.delete_item(Key={self.key_name: widget_id})
-        except Exception as e:
-            logger.error(f"DynamoDB delete failed ({widget_id}): {e}")
-            raise
-
-
-# ------------------------------------------------------
-# SQS CONSUMER
-# ------------------------------------------------------
-
-class SQSConsumer:
-    def __init__(self, client, queue_url: str):
-        self.client = client
-        self.queue_url = queue_url
-        logger.info(f"Connected to SQS queue → {queue_url}")
-
-    def receive_messages(self):
-        try:
-            response = self.client.receive_message(
-                QueueUrl=self.queue_url,
-                MaxNumberOfMessages=10,
-                WaitTimeSeconds=10
-            )
-            messages = response.get("Messages", [])
-
-            if messages:
-                logger.info(f"SQS received {len(messages)} message(s)")
-
-            return messages
-
-        except Exception as e:
-            logger.error(f"SQS receive failed: {e}")
-            return []
-
-    def delete_message(self, receipt_handle: str):
-        try:
-            self.client.delete_message(
-                QueueUrl=self.queue_url,
-                ReceiptHandle=receipt_handle
-            )
-            logger.info("SQS DELETE → message removed")
-        except Exception as e:
-            logger.error(f"SQS delete failed: {e}")
-            raise
-
-
-# ------------------------------------------------------
-# WIDGET PROCESSOR
-# ------------------------------------------------------
-
-class WidgetProcessor:
-    def __init__(self, s3_manager: S3Manager, dynamo_manager: DynamoDBManager):
-        self.s3 = s3_manager
-        self.db = dynamo_manager
-
-    def process(self, widget: dict):
-        wtype = widget["type"]
+    def delete(self, widget: dict):
+        """Simple delete for 'delete' request."""
         widget_id = widget["widgetId"]
+        
+        # Delete from DynamoDB
+        if self.db_table:
+            logger.info(f"DynamoDB DELETE → {self.db_table.name}:{widget_id}")
+            # This will CRASH if the item doesn't exist, as requested
+            self.db_table.delete_item(
+                Key={"widgetId": widget_id},
+                ConditionExpression="attribute_exists(widgetId)"
+            )
 
-        logger.info(f"PROCESS → widgetId={widget_id}, type={wtype}")
-
-        if wtype in ("create", "update"):
-            self.s3.store_widget(widget)
-            self.db.create_or_update_widget(widget)
-
-        elif wtype == "delete":
-            self.db.delete_widget(widget_id)
-
-        else:
-            logger.warning(f"Unknown widget type encountered: {wtype}")
-
-
-# ------------------------------------------------------
-# MAIN APP LOOP
-# ------------------------------------------------------
-
-class WidgetApp:
-    def __init__(self, args):
-        logger.info("WidgetApp starting…")
-        logger.info(f"Profile={args.profile}, Region={args.region}, Queue={args.request_queue}")
-        logger.info(f"Bucket={args.request_bucket}, Table={args.table_name}")
-
-        aws = AWSClientFactory(args.profile, args.region)
-
-        self.sqs = SQSConsumer(aws.sqs(), args.request_queue)
-        self.s3 = S3Manager(aws.s3(), args.request_bucket, args.use_owner_in_prefix)
-        self.db = DynamoDBManager(aws.dynamodb(), args.table_name, args.db_key_name)
-
-        self.processor = WidgetProcessor(self.s3, self.db)
-
-        self.max_runtime = args.max_runtime
-        self.start_time = time.time()
-
-    def run(self):
-        logger.info("WidgetApp is running…")
-
-        while True:
-            # Check timeout
-            if self.max_runtime > 0:
-                elapsed = (time.time() - self.start_time) * 1000
-                if elapsed > self.max_runtime:
-                    logger.info("Max runtime reached → stopping")
-                    break
-
-            messages = self.sqs.receive_messages()
-            if not messages:
-                continue
-
-            for msg in messages:
-                try:
-                    body = json.loads(msg["Body"])
-                    self.processor.process(body)
-                    self.sqs.delete_message(msg["ReceiptHandle"])
-                except Exception as e:
-                    logger.error(f"Process failed: {e}")
-                    logger.error(f"Message body: {msg['Body']}")
-
+        # Delete from S3
+        if self.s3_bucket:
+            key = self._get_s3_key(widget)
+            logger.info(f"S3 DELETE → s3://{self.s3_bucket}/{key}")
+            self.s3.delete_object(Bucket=self.s3_bucket, Key=key)
 
 # ------------------------------------------------------
-# ARGUMENT PARSER
+# REQUEST POLLERS (HW6 & HW7)
 # ------------------------------------------------------
+class SqsPoller:
+    """Polls SQS, processes messages, and deletes them."""
+    def __init__(self, sqs_client, queue_url: str):
+        self.sqs = sqs_client
+        self.queue_url = queue_url
+        logger.info(f"Using SQS request source → {queue_url}")
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Widget Processor")
+    def poll(self):
+        """Polls SQS for messages."""
+        response = self.sqs.receive_message(
+            QueueUrl=self.queue_url,
+            MaxNumberOfMessages=10,  # Read up to 10 at a time
+            WaitTimeSeconds=20       # Use long polling
+        )
+        messages = response.get("Messages", [])
+        
+        if messages:
+            logger.info(f"SQS received {len(messages)} message(s)")
+        
+        return messages
 
-    parser.add_argument("-p", "--profile", default="default")
-    parser.add_argument("-r", "--region", default="us-east-1")
-    parser.add_argument("-mrt", "--max-runtime", type=int, default=0)
+    def delete_message(self, message: dict):
+        """Deletes a message from the SQS queue."""
+        receipt_handle = message["ReceiptHandle"]
+        self.sqs.delete_message(
+            QueueUrl=self.queue_url,
+            ReceiptHandle=receipt_handle
+        )
+        logger.info("SQS DELETE → message removed")
 
-    parser.add_argument("-rb", "--request-bucket", default=None)
-    parser.add_argument("-uop", "--use-owner-in-prefix", action="store_true")
+class S3Poller:
+    """Polls S3 for request files (HW6)."""
+    def __init__(self, s3_client, bucket_name: str):
+        self.s3 = s3_client
+        self.bucket = bucket_name
+        logger.info(f"Using S3 request source → {bucket_name}")
 
-    parser.add_argument("-rq", "--request-queue", required=True)
+    def poll(self):
+        """Polls for one message from S3."""
+        response = self.s3.list_objects_v2(Bucket=self.bucket, MaxKeys=1)
+        if "Contents" not in response or not response["Contents"]:
+            return [] # No messages
+        
+        s3_key = response["Contents"][0]["Key"]
+        logger.info(f"S3 received message → {s3_key}")
 
-    parser.add_argument("--table-name", default="Widgets")
-    parser.add_argument("--db-key-name", default="id")
+        # Read the object
+        obj = self.s3.get_object(Bucket=self.bucket, Key=s3_key)
+        body_str = obj['Body'].read().decode('utf-8')
+        
+        # Return in a compatible format
+        message = {
+            "Body": body_str,
+            "S3Key": s3_key, # For deletion
+            "ReceiptHandle": s3_key # For compatibility
+        }
+        return [message]
 
-    return parser.parse_args()
-
+    def delete_message(self, message: dict):
+        """Deletes a message from the S3 bucket."""
+        s3_key = message["S3Key"]
+        self.s3.delete_object(Bucket=self.bucket, Key=s3_key)
+        logger.info(f"S3 DELETE → request removed: {s3_key}")
 
 # ------------------------------------------------------
-# ENTRY POINT
+# MAIN APP
 # ------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="HW7 Widget Consumer")
+    
+    # AWS Config
+    parser.add_argument("-p", "--profile", default="default", help="AWS profile name")
+    parser.add_argument("-r", "--region", default="us-east-1", help="AWS region")
+    
+    # --- Request Source (HW6 or HW7) ---
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-rq", "--request-queue", default=None, help="SQS request queue URL (HW7 source)")
+    group.add_argument("-srb", "--s3-request-bucket", default=None, help="S3 request bucket name (HW6 source)")
+
+    # --- Storage Destination (HW6) ---
+    parser.add_argument("-dwt", "--dynamodb-widget-table", default="widgets", help="DynamoDB table for widgets")
+    parser.add_argument("-swb", "--s3-widget-bucket", default=None, help="S3 bucket for widgets (optional)")
+    parser.add_argument("-swkp", "--s3-widget-key-prefix", default="widgets/", help="S3 key prefix for widgets")
+
+    args = parser.parse_args()
+
+    logger.info("Starting Widget Consumer App...")
+    
+    # Setup dependencies
+    aws = AWSClientFactory(args.profile, args.region)
+    storage = WidgetStorage(
+        s3_client=aws.s3(),
+        db_resource=aws.dynamodb(),
+        db_table_name=args.dynamodb_widget_table,
+        s3_bucket_name=args.s3_widget_bucket,
+        s3_key_prefix=args.s3_widget_key_prefix
+    )
+    
+    # --- CHOOSE POLLER (HW6 or HW7) ---
+    if args.request_queue:
+        poller = SqsPoller(aws.sqs(), args.request_queue)
+    elif args.s3_request_bucket:
+        poller = S3Poller(aws.s3(), args.s3_request_bucket)
+    else:
+        # This part is technically unreachable due to the "required=True" group
+        logger.critical("No request source specified. Exiting.")
+        sys.exit(1)
+
+    # Run loop
+    logger.info("Application running. Polling for messages...")
+    while True:
+        messages = poller.poll()
+        if not messages:
+            # If S3, we need to wait manually
+            if isinstance(poller, S3Poller):
+                time.sleep(5) # S3 polling can be slower
+            continue # SQS long polling already waited
+        
+        for msg in messages:
+            widget = json.loads(msg["Body"])
+            request_type = widget.get("type", "unknown")
+            widget_id = widget.get("widgetId", "unknown")
+            
+            logger.info(f"PROCESS → widgetId={widget_id}, type={request_type}")
+
+            if request_type in ("create", "update"):
+                storage.create_or_update(widget)
+            elif request_type == "delete":
+                storage.delete(widget) # Pass full widget for S3 key
+            else:
+                logger.warning(f"Unknown request type '{request_type}' for {widget_id}")
+            
+            # If processing was successful, delete message
+            poller.delete_message(msg)
 
 if __name__ == "__main__":
-    args = parse_args()
-    app = WidgetApp(args)
-    app.run()
+    main()
