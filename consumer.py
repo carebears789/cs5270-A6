@@ -1,221 +1,267 @@
-import argparse
-import boto3
 import json
 import time
+import argparse
+import boto3
 import logging
+from botocore.exceptions import ClientError
 import sys
 
-# Define the maximum time to wait for a new request before exiting (30 seconds)
-MAX_WAIT_TIME = 30
+# ------------------------------------------------------
+# SETUP LOGGING (FILE ONLY, CLEAN)
+# ------------------------------------------------------
+
+LOG_FILE = "widget_app.log"
+
+# Remove existing handlers so nothing logs to terminal
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,                   # <--- CLEAN INFO LOGGING
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+logger = logging.getLogger("WidgetApp")
 
 
-def validate_args(args):
-    """
-    Validates input arguments based on the selected storage backend.
+# Add a StreamHandler to also print to terminal
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
 
-    Exits the program if required arguments are missing.
-    """
-    if args.storage == "dynamo" and not args.table:
-        print("🛑 Error: If 'dynamo' is selected for storage, --table is required.")
-        sys.exit(1)
-    
-    if args.storage == "s3" and not args.target_bucket:
-        print("🛑 Error: If 's3' is selected for storage, --target-bucket is required.")
-        sys.exit(1)
+# ------------------------------------------------------
+# AWS CLIENT FACTORY
+# ------------------------------------------------------
 
-    if not args.source_bucket:
-        print("🛑 Error: --source-bucket is required for polling requests.")
-        sys.exit(1)
+class AWSClientFactory:
+    def __init__(self, profile: str, region: str):
+        logger.info(f"Initializing AWS session (profile={profile}, region={region})")
+        self.session = boto3.Session(profile_name=profile, region_name=region)
 
-# Renaming args.bucket to args.source_bucket for clarity in main/argparse
-def get_request(s3, source_bucket_name):
-    """
-    Polls the source S3 bucket for the next widget request file.
-    
-    The request file is the one with the lexicographically smallest key.
-    It returns the request data and deletes the file upon success.
+    def sqs(self):
+        return self.session.client("sqs")
 
-    :param s3: Boto3 S3 client object.
-    :param source_bucket_name: Name of the S3 bucket to poll requests from.
-    :return: The request data (dict) or None if no files are found.
-    """
-    try:
-        response = s3.list_objects_v2(Bucket=source_bucket_name, MaxKeys=1)
-        
-        if "Contents" not in response:
-            return None
-        
-        # Get the key of the first (smallest) object
-        next_key = response["Contents"][0]["Key"]
-        
-        # Retrieve object content
-        obj = s3.get_object(Bucket=source_bucket_name, Key=next_key)
-        data = json.loads(obj["Body"].read())
+    def s3(self):
+        return self.session.client("s3")
 
-        # Delete the processed object
-        s3.delete_object(Bucket=source_bucket_name, Key=next_key)
-        
-        return data
-    except Exception as e:
-        logging.error(f"Error getting or deleting request from S3: {e}")
-        return None
-
-def store_in_s3(s3, target_bucket_name, request):
-    """
-    Stores the processed widget data into the target S3 bucket.
-
-    The key format is: widgets/<owner_name_slug>/<widget_id>
-
-    :param s3: Boto3 S3 client object.
-    :param target_bucket_name: Name of the S3 bucket to store processed widgets in.
-    :param request: The incoming request dictionary containing the 'widget'.
-    """
-    widget = request.get('widget', {})
-    if not widget:
-        logging.warning("Cannot store in S3: 'widget' not found in request.")
-        return
-        
-    processed_owner = widget.get('owner', 'unknown').replace(' ', '-').lower()
-    widget_id = widget.get('widgetId', str(time.time())) # Fallback widgetId
-
-    key = f"widgets/{processed_owner}/{widget_id}.json"
-    
-    # Store the entire request, or just the widget, depending on requirements.
-    # Sticking to the original code's logic: store the request content.
-    logging.info(f"Storing widget to S3 at key: {key}")
-    try:
-        s3.put_object(
-            Bucket=target_bucket_name, 
-            Key=key, 
-            Body=json.dumps(request)
-        )
-    except Exception as e:
-        logging.error(f"Error storing to S3: {e}")
+    def dynamodb(self):
+        return self.session.resource("dynamodb")
 
 
-def dynamo_store(dynamo_table, widget):
-    """
-    Stores the widget data into the DynamoDB table.
+# ------------------------------------------------------
+# S3 MANAGER
+# ------------------------------------------------------
 
-    It flattens attributes from the 'otherAttributes' list into top-level keys.
+class S3Manager:
+    def __init__(self, client, bucket: str, use_owner_prefix: bool):
+        self.client = client
+        self.bucket = bucket
+        self.use_owner_prefix = use_owner_prefix
 
-    :param dynamo_table: Boto3 DynamoDB Table resource object.
-    :param widget: The widget dictionary to be stored.
-    """
-    dynamo_item = widget.copy()
-    
-    other_attributes_list = dynamo_item.pop('otherAttributes', [])
-
-    for attr in other_attributes_list:
-        # Check for required keys and ensure they are not None before assignment
-        if 'name' in attr and 'value' in attr and attr['name'] and attr['value'] is not None:
-            dynamo_item[attr['name']] = attr['value']
-    
-    logging.info(f"Storing widget ID {widget.get('widgetId')} to DynamoDB.")
-    try:
-        dynamo_table.put_item(Item=dynamo_item)
-    except Exception as e:
-        logging.error(f"Error storing to DynamoDB: {e}")
-
-
-def process_request(request, storage, s3, dynamo_table, target_bucket):
-    """
-    Processes a single widget request based on the action type and storage backend.
-
-    :param request: The request dictionary received from the source S3 bucket.
-    :param storage: The selected storage backend ("s3" or "dynamo").
-    :param s3: Boto3 S3 client object.
-    :param dynamo_table: Boto3 DynamoDB Table resource object.
-    :param target_bucket: Name of the S3 bucket for storing processed widgets.
-    """
-    action = request.get("type")
-    widget = request.get("widget")
-
-    if not action or not widget:
-        logging.warning(f"Malformed request received: {request}")
-        return
-
-    if action == "create" or action == "update":
-        if storage == "s3":
-            logging.info(f"Processing '{action}' action for S3 storage.")
-            store_in_s3(s3, target_bucket, request)
+        if bucket:
+            logger.info(f"S3 enabled → bucket={bucket}, prefix_by_owner={use_owner_prefix}")
         else:
-            logging.info(f"Processing '{action}' action for DynamoDB storage.")
-            dynamo_store(dynamo_table, widget)
-            
-    elif action == "delete":
-        logging.info(f"Action 'delete' not implemented yet for widget ID: {widget.get('widgetId')}.")
-    else:
-        logging.warning(f"Unknown action type received: {action}")
+            logger.info("S3 disabled (no bucket provided)")
 
-def main():
-    """
-    Main execution function. Sets up logging, parses arguments, and starts the polling loop.
-    """
-    
-    # --- Logging Setup ---
-    logging.basicConfig(
-        filename='consumer.log',
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s:%(message)s'
-    )
-    logging.info("Consumer process starting...")
-    
-    # --- Argument Parsing ---
-    parser = argparse.ArgumentParser(description="Widget Consumer: Polls S3 for widget requests and stores them in S3 or DynamoDB.")
-    parser.add_argument("--storage", choices=["s3", "dynamo"], required=True,
-                        help="Storage backend for processed widgets.")
-    parser.add_argument("--interval", type=float, default=0.1, 
-                        help="Polling interval in seconds (default: 0.1).")
-    parser.add_argument("--source-bucket", required=True, 
-                        help="S3 bucket name where incoming requests are placed.")
-    parser.add_argument("--table", 
-                        help="DynamoDB table name (if using DynamoDB storage).")
-    parser.add_argument("--target-bucket", 
-                        help="S3 bucket name where processed widgets are stored (if using S3 storage).")
-    args = parser.parse_args()
+    def store_widget(self, widget: dict):
+        if not self.bucket:
+            return
 
-    # --- Input Validation ---
-    validate_args(args)
-    
-    # --- AWS Client Setup ---
-    try:
-        s3 = boto3.client("s3")
-        dynamo_table = boto3.resource("dynamodb").Table(args.table) if args.table else None
-    except Exception as e:
-        logging.error(f"Failed to initialize AWS clients: {e}")
-        sys.exit(1)
+        owner = widget.get("owner", "unknown").replace(" ", "_")
+        widget_id = widget["widgetId"]
+        key = f"{owner}/{widget_id}.json" if self.use_owner_prefix else f"{widget_id}.json"
+
+        logger.info(f"S3 WRITE → s3://{self.bucket}/{key}")
+
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=json.dumps(widget).encode("utf-8")
+            )
+        except Exception as e:
+            logger.error(f"S3 write failed for {key}: {e}")
+            raise
 
 
-    # --- Polling Loop ---
-    start_time_no_request = None # Time marker for when the loop first found no requests
+# ------------------------------------------------------
+# DYNAMODB MANAGER
+# ------------------------------------------------------
 
-    while True:
-        request = get_request(s3, args.source_bucket)
-        
-        if request:
-            # Request found: process it and reset the wait timer
-            logging.info("Request received. Processing...")
-            process_request(request, args.storage, s3, dynamo_table, args.target_bucket)
-            start_time_no_request = None
-            
+class DynamoDBManager:
+    def __init__(self, dynamodb_resource, table_name="Widgets", key_name="id"):
+        self.table = dynamodb_resource.Table(table_name)
+        self.key_name = key_name
+        logger.info(f"DynamoDB connected → table={table_name}, key={key_name}")
+
+    def _map_widget_to_item(self, widget: dict):
+        item = widget.copy()
+        item[self.key_name] = widget["widgetId"]
+        return item
+
+    def create_or_update_widget(self, widget: dict):
+        item = self._map_widget_to_item(widget)
+        logger.info(f"DynamoDB UPSERT → {self.table.name}:{item[self.key_name]}")
+
+        try:
+            self.table.put_item(Item=item)
+        except Exception as e:
+            logger.error(f"DynamoDB upsert failed ({item[self.key_name]}): {e}")
+            raise
+
+    def delete_widget(self, widget_id: str):
+        logger.info(f"DynamoDB DELETE → {self.table.name}:{widget_id}")
+
+        try:
+            self.table.delete_item(Key={self.key_name: widget_id})
+        except Exception as e:
+            logger.error(f"DynamoDB delete failed ({widget_id}): {e}")
+            raise
+
+
+# ------------------------------------------------------
+# SQS CONSUMER
+# ------------------------------------------------------
+
+class SQSConsumer:
+    def __init__(self, client, queue_url: str):
+        self.client = client
+        self.queue_url = queue_url
+        logger.info(f"Connected to SQS queue → {queue_url}")
+
+    def receive_messages(self):
+        try:
+            response = self.client.receive_message(
+                QueueUrl=self.queue_url,
+                MaxNumberOfMessages=10,
+                WaitTimeSeconds=10
+            )
+            messages = response.get("Messages", [])
+
+            if messages:
+                logger.info(f"SQS received {len(messages)} message(s)")
+
+            return messages
+
+        except Exception as e:
+            logger.error(f"SQS receive failed: {e}")
+            return []
+
+    def delete_message(self, receipt_handle: str):
+        try:
+            self.client.delete_message(
+                QueueUrl=self.queue_url,
+                ReceiptHandle=receipt_handle
+            )
+            logger.info("SQS DELETE → message removed")
+        except Exception as e:
+            logger.error(f"SQS delete failed: {e}")
+            raise
+
+
+# ------------------------------------------------------
+# WIDGET PROCESSOR
+# ------------------------------------------------------
+
+class WidgetProcessor:
+    def __init__(self, s3_manager: S3Manager, dynamo_manager: DynamoDBManager):
+        self.s3 = s3_manager
+        self.db = dynamo_manager
+
+    def process(self, widget: dict):
+        wtype = widget["type"]
+        widget_id = widget["widgetId"]
+
+        logger.info(f"PROCESS → widgetId={widget_id}, type={wtype}")
+
+        if wtype in ("create", "update"):
+            self.s3.store_widget(widget)
+            self.db.create_or_update_widget(widget)
+
+        elif wtype == "delete":
+            self.db.delete_widget(widget_id)
+
         else:
-            # No request found: check the timeout condition
-            if start_time_no_request is None:
-                start_time_no_request = time.time()
-                logging.info(f"No requests found. Starting max wait timer of {MAX_WAIT_TIME} seconds.")
-            
-            elapsed_time_no_request = time.time() - start_time_no_request
-            
-            if elapsed_time_no_request >= MAX_WAIT_TIME:
-                logging.info(f"Max wait time of {MAX_WAIT_TIME} seconds reached without new requests. Exiting consumer.")
-                break # Exit the infinite loop
-            
-            # Wait for the next poll interval
-            time.sleep(args.interval)
+            logger.warning(f"Unknown widget type encountered: {wtype}")
 
-    logging.info("Consumer process shut down gracefully.")
 
+# ------------------------------------------------------
+# MAIN APP LOOP
+# ------------------------------------------------------
+
+class WidgetApp:
+    def __init__(self, args):
+        logger.info("WidgetApp starting…")
+        logger.info(f"Profile={args.profile}, Region={args.region}, Queue={args.request_queue}")
+        logger.info(f"Bucket={args.request_bucket}, Table={args.table_name}")
+
+        aws = AWSClientFactory(args.profile, args.region)
+
+        self.sqs = SQSConsumer(aws.sqs(), args.request_queue)
+        self.s3 = S3Manager(aws.s3(), args.request_bucket, args.use_owner_in_prefix)
+        self.db = DynamoDBManager(aws.dynamodb(), args.table_name, args.db_key_name)
+
+        self.processor = WidgetProcessor(self.s3, self.db)
+
+        self.max_runtime = args.max_runtime
+        self.start_time = time.time()
+
+    def run(self):
+        logger.info("WidgetApp is running…")
+
+        while True:
+            # Check timeout
+            if self.max_runtime > 0:
+                elapsed = (time.time() - self.start_time) * 1000
+                if elapsed > self.max_runtime:
+                    logger.info("Max runtime reached → stopping")
+                    break
+
+            messages = self.sqs.receive_messages()
+            if not messages:
+                continue
+
+            for msg in messages:
+                try:
+                    body = json.loads(msg["Body"])
+                    self.processor.process(body)
+                    self.sqs.delete_message(msg["ReceiptHandle"])
+                except Exception as e:
+                    logger.error(f"Process failed: {e}")
+                    logger.error(f"Message body: {msg['Body']}")
+
+
+# ------------------------------------------------------
+# ARGUMENT PARSER
+# ------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Widget Processor")
+
+    parser.add_argument("-p", "--profile", default="default")
+    parser.add_argument("-r", "--region", default="us-east-1")
+    parser.add_argument("-mrt", "--max-runtime", type=int, default=0)
+
+    parser.add_argument("-rb", "--request-bucket", default=None)
+    parser.add_argument("-uop", "--use-owner-in-prefix", action="store_true")
+
+    parser.add_argument("-rq", "--request-queue", required=True)
+
+    parser.add_argument("--table-name", default="Widgets")
+    parser.add_argument("--db-key-name", default="id")
+
+    return parser.parse_args()
+
+
+# ------------------------------------------------------
+# ENTRY POINT
+# ------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    app = WidgetApp(args)
+    app.run()
