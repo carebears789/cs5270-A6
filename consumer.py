@@ -64,16 +64,16 @@ class WidgetStorage:
 
     def _get_s3_key(self, widget: dict) -> str:
         """
-        [cite_start]Generates the S3 key based on HW6 rules [cite: 463-466].
+        Generates the S3 key.
         Format: widgets/{owner-with-dashes}/{widget-id}.json
         """
         widget_id = widget.get("widgetId", "unknown-id")
         owner = widget.get("owner", "unknown-owner")
         
-        # HW6 format: replace spaces with dashes, lowercase
+        # Format: replace spaces with dashes, lowercase
         formatted_owner = owner.replace(" ", "-").lower()
         
-        # HW6 format: widgets/{owner}/{widget id}
+        # Format: widgets/{owner}/{widget id}
         return f"{self.s3_prefix}{formatted_owner}/{widget_id}.json"
 
     def create_or_update(self, widget: dict):
@@ -83,8 +83,15 @@ class WidgetStorage:
         # Store in DynamoDB
         if self.db_table:
             logger.info(f"DynamoDB UPSERT → {self.db_table.name}:{widget_id}")
-            # Simple put_item, no partial update or flattening
-            self.db_table.put_item(Item=widget)
+            
+            # --- FIX ---
+            # Create a new item dict and map 'widgetId' to 'id'
+            item_to_save = widget.copy()
+            item_to_save['id'] = widget['widgetId'] # Map to the 'id' key
+            # --- END FIX ---
+            
+            # Save the new item, which now has the 'id' key
+            self.db_table.put_item(Item=item_to_save)
 
         # Store in S3
         if self.s3_bucket:
@@ -103,11 +110,14 @@ class WidgetStorage:
         # Delete from DynamoDB
         if self.db_table:
             logger.info(f"DynamoDB DELETE → {self.db_table.name}:{widget_id}")
-            # This will CRASH if the item doesn't exist, as requested
+            
+            # --- FIX ---
+            # Use the table's primary key 'id'
             self.db_table.delete_item(
-                Key={"widgetId": widget_id},
-                ConditionExpression="attribute_exists(widgetId)"
+                Key={"id": widget_id}, 
+                ConditionExpression="attribute_exists(id)"
             )
+            # --- END FIX ---
 
         # Delete from S3
         if self.s3_bucket:
@@ -116,7 +126,7 @@ class WidgetStorage:
             self.s3.delete_object(Bucket=self.s3_bucket, Key=key)
 
 # ------------------------------------------------------
-# REQUEST POLLERS (HW6 & HW7)
+# REQUEST POLLERS
 # ------------------------------------------------------
 class SqsPoller:
     """Polls SQS, processes messages, and deletes them."""
@@ -149,7 +159,7 @@ class SqsPoller:
         logger.info("SQS DELETE → message removed")
 
 class S3Poller:
-    """Polls S3 for request files (HW6)."""
+    """Polls S3 for request files."""
     def __init__(self, s3_client, bucket_name: str):
         self.s3 = s3_client
         self.bucket = bucket_name
@@ -186,18 +196,19 @@ class S3Poller:
 # MAIN APP
 # ------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="HW7 Widget Consumer")
+    parser = argparse.ArgumentParser(description="Widget Consumer")
     
     # AWS Config
     parser.add_argument("-p", "--profile", default="default", help="AWS profile name")
     parser.add_argument("-r", "--region", default="us-east-1", help="AWS region")
     
-    # --- Request Source (HW6 or HW7) ---
+    # --- Request Source ---
+    # Use a mutually exclusive group to enforce one or the other
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-rq", "--request-queue", default=None, help="SQS request queue URL (HW7 source)")
-    group.add_argument("-srb", "--s3-request-bucket", default=None, help="S3 request bucket name (HW6 source)")
+    group.add_argument("-rq", "--request-queue", default=None, help="SQS request queue URL")
+    group.add_argument("-srb", "--s3-request-bucket", default=None, help="S3 request bucket name")
 
-    # --- Storage Destination (HW6) ---
+    # --- Storage Destination ---
     parser.add_argument("-dwt", "--dynamodb-widget-table", default="widgets", help="DynamoDB table for widgets")
     parser.add_argument("-swb", "--s3-widget-bucket", default=None, help="S3 bucket for widgets (optional)")
     parser.add_argument("-swkp", "--s3-widget-key-prefix", default="widgets/", help="S3 key prefix for widgets")
@@ -216,7 +227,7 @@ def main():
         s3_key_prefix=args.s3_widget_key_prefix
     )
     
-    # --- CHOOSE POLLER (HW6 or HW7) ---
+    # --- CHOOSE POLLER ---
     if args.request_queue:
         poller = SqsPoller(aws.sqs(), args.request_queue)
     elif args.s3_request_bucket:
