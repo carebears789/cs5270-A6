@@ -25,6 +25,23 @@ class TestConsumer(unittest.TestCase):
             keys = [obj["Key"] for obj in s3.list_objects_v2(Bucket="usu-cs5270-scuba-requests")["Contents"]]
             self.assertNotIn("001.json", keys)
 
+    def test_store_in_s3_puts_object(self):
+        s3 = MagicMock()
+        widget = {
+            "owner": "John Doe",
+            "widgetId": "abc"
+        }
+
+        widget_consumer.store_in_s3(s3, "test-bucket", widget)
+
+        expected_key = "widgets/john-doe/abc"
+        s3.put_object.assert_called_once()
+        args, kwargs = s3.put_object.call_args
+        self.assertEqual(kwargs["Key"], expected_key)
+        body_data = json.loads(kwargs["Body"])
+        self.assertEqual(body_data, widget)
+
+
     def test_store_widget_dynamo(self):
         with mock_aws():
             dyanmo_test = boto3.resource("dynamodb", region_name="us-east-1")
@@ -65,21 +82,6 @@ class TestConsumer(unittest.TestCase):
         s3.get_object.assert_called_once_with(Bucket="test-bucket", Key="file1.json")
         s3.delete_object.assert_called_once_with(Bucket="test-bucket", Key="file1.json")
 
-    def test_store_in_s3_puts_object(self):
-        s3 = MagicMock()
-        widget = {
-            "owner": "John Doe",
-            "widgetId": "abc"
-        }
-
-        widget_consumer.store_in_s3(s3, "test-bucket", widget)
-
-        expected_key = "widgets/john-doe/abc"
-        s3.put_object.assert_called_once()
-        args, kwargs = s3.put_object.call_args
-        self.assertEqual(kwargs["Key"], expected_key)
-        body_data = json.loads(kwargs["Body"])
-        self.assertEqual(body_data, widget)
 
 
 if __name__ == "__main__":
