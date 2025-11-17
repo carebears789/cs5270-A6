@@ -15,4 +15,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Command to run your program
-CMD ["python", "consumer.py", "-rq", "https://sqs.us-east-1.amazonaws.com/637423576340/cs5270-requests", "-rb", "usu-cs5270-scuba-requests"]
+CMD ["python", "consumer.py", "-rq", "https://sqs.us-east-1.amazonaws.com/637423576340/cs5270-requests", "-swb", "usu-cs5270-scuba-requests"]
