@@ -70,10 +70,8 @@ class WidgetStorage:
         widget_id = widget.get("widgetId", "unknown-id")
         owner = widget.get("owner", "unknown-owner")
         
-        # Format: replace spaces with dashes, lowercase
         formatted_owner = owner.replace(" ", "-").lower()
         
-        # Format: widgets/{owner}/{widget id}
         return f"{self.s3_prefix}{formatted_owner}/{widget_id}.json"
 
     def create_or_update(self, widget: dict):
@@ -83,14 +81,10 @@ class WidgetStorage:
         # Store in DynamoDB
         if self.db_table:
             logger.info(f"DynamoDB UPSERT → {self.db_table.name}:{widget_id}")
-            
-            # --- FIX ---
-            # Create a new item dict and map 'widgetId' to 'id'
+
             item_to_save = widget.copy()
-            item_to_save['id'] = widget['widgetId'] # Map to the 'id' key
-            # --- END FIX ---
-            
-            # Save the new item, which now has the 'id' key
+            item_to_save['id'] = widget['widgetId']
+
             self.db_table.put_item(Item=item_to_save)
 
         # Store in S3
@@ -111,13 +105,11 @@ class WidgetStorage:
         if self.db_table:
             logger.info(f"DynamoDB DELETE → {self.db_table.name}:{widget_id}")
             
-            # --- FIX ---
             # Use the table's primary key 'id'
             self.db_table.delete_item(
                 Key={"id": widget_id}, 
                 ConditionExpression="attribute_exists(id)"
             )
-            # --- END FIX ---
 
         # Delete from S3
         if self.s3_bucket:
@@ -233,19 +225,29 @@ def main():
     elif args.s3_request_bucket:
         poller = S3Poller(aws.s3(), args.s3_request_bucket)
     else:
-        # This part is technically unreachable due to the "required=True" group
         logger.critical("No request source specified. Exiting.")
         sys.exit(1)
 
     # Run loop
     logger.info("Application running. Polling for messages...")
+
+    # 1. Capture the start time
+    start_time = time.time()
+
     while True:
+        # 2. Check if 30 seconds have passed
+        if time.time() - start_time > 30:
+            # Assuming you have a logger setup based on your snippet
+            logger.info("Time limit of 30 seconds reached. Stopping.") 
+            break
+
         messages = poller.poll()
+        
         if not messages:
             # If S3, we need to wait manually
             if isinstance(poller, S3Poller):
-                time.sleep(5) # S3 polling can be slower
-            continue # SQS long polling already waited
+                time.sleep(5)
+            continue 
         
         for msg in messages:
             widget = json.loads(msg["Body"])
@@ -262,7 +264,7 @@ def main():
                 logger.warning(f"Unknown request type '{request_type}' for {widget_id}")
             
             # If processing was successful, delete message
-            poller.delete_message(msg)
+            poller.delete_message(msg)`
 
 if __name__ == "__main__":
     main()
